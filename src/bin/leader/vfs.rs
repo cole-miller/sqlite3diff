@@ -4,6 +4,7 @@ use bus::Bus;
 use rusqlite::ffi::*;
 use std::cell::{Cell, RefCell};
 use std::ffi::*;
+use std::mem::ManuallyDrop;
 use zstr::zstr;
 
 const PAGE_SIZE: usize = 4096;
@@ -151,7 +152,9 @@ pub fn make(orig: &CStr, tx: Bus<Message>) -> *mut sqlite3_vfs {
             Ok((file, o)) => {
                 unsafe {
                     f.cast::<File>().write(file);
-                    flags_out.write(o);
+                    if !flags_out.is_null() {
+                        flags_out.write(o);
+                    }
                 }
                 SQLITE_OK
             }
@@ -166,7 +169,7 @@ pub fn make(orig: &CStr, tx: Bus<Message>) -> *mut sqlite3_vfs {
         mxPathname: unsafe { (*orig).mxPathname },
         pAppData: Box::into_raw(Box::new(Data {
             orig,
-            tx: RefCell::new(tx),
+            tx: ManuallyDrop::new(RefCell::new(tx)),
         }))
         .cast(),
         pNext: std::ptr::null_mut(),
@@ -193,14 +196,14 @@ pub fn make(orig: &CStr, tx: Bus<Message>) -> *mut sqlite3_vfs {
 
 struct Data {
     orig: *mut sqlite3_vfs,
-    tx: RefCell<Bus<Message>>,
+    tx: ManuallyDrop<RefCell<Bus<Message>>>,
 }
 
 #[repr(C)]
 struct File {
     base: sqlite3_file,
     orig: *mut sqlite3_file,
-    tx: *const RefCell<Bus<Message>>,
+    tx: *const ManuallyDrop<RefCell<Bus<Message>>>,
     flags: c_int,
     pending_pgno: Cell<Option<PageNumber>>,
 }

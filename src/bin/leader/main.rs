@@ -138,9 +138,9 @@ fn main() -> anyhow::Result<()> {
         sqlite3_vfs_register(vfs, 1 /* make default */);
     }
     let conn = rusqlite::Connection::open(&args.db_name)?;
-    conn.execute("PRAGMA journal_mode=WAL", ())?;
+    conn.query_row("PRAGMA journal_mode=WAL", (), |_| Ok(()))?;
     // XXX
-    conn.execute("PRAGMA wal_autocheckpoint=0", ())?;
+    conn.query_row("PRAGMA wal_autocheckpoint=0", (), |_| Ok(()))?;
     let addr = args.addr.to_socket_addrs()?.nth(0).unwrap();
     let mut listener = mio::net::TcpListener::bind(addr)?;
     let mut status = Status::Available(snapshot_rx);
