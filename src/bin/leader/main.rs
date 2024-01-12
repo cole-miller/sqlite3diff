@@ -22,6 +22,22 @@
 //! SQLite's auto-checkpoint is turned off; you can trigger a checkpoint from outside by sending
 //! SIGUSR1 to the server process. The server listens for both clients and followers on the same
 //! address, provided on the command line.
+//!
+//! ## Wire protocols
+//!
+//! Requests from clients are simply SQL strings (not NUL-terminated). Only SQL requests that don't
+//! return rows are supported.
+//!
+//! Requests from followers consist of a single NUL byte follower by a stream of 32-byte checksums.
+//! The server responds using a variant of the rdiff delta format:
+//!
+//! * `RS_OP_LITERAL_N8`, `RS_OP_COPY_N8_N8`, and `RS_OP_END` are used in the conventional way.
+//!   `RS_OP_END` always signals a *successful* end to the snapshot installation process.
+//! * The byte `0xff` signals an *unsuccessful* end to the snapshot installation process.
+//! * The byte `0xfe` introduces a special kind of literal command. It is followed by an 8-byte
+//!   big-endian offset `start` nd an 8-byte big-endian length `len`, then by `len` bytes of
+//!   literal data. The semantics is that the follower should write those `len` bytes to its
+//!   database file beginning at `start`.
 
 use bus::*;
 use clap::{Parser, ValueEnum};
