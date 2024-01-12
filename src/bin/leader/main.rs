@@ -230,6 +230,7 @@ fn main() -> anyhow::Result<()> {
                     let Status::Available(rx) = status else {
                         continue;
                     };
+                    stream.read_exact(std::slice::from_mut(&mut b))?;
                     let db = File::open(&db_name)?;
                     status =
                         Status::Busy(scope.spawn(|| {
