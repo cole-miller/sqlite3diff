@@ -45,7 +45,7 @@ use indexmap::IndexMap;
 use parking_lot::RwLock;
 use rusqlite::ffi::*;
 use signal_hook::consts::SIGUSR1;
-use sqlite3diff::{sendfile, write_del, Cksum, Delta, PageNumber, CKSUM_SIZE, PAGE_SIZE};
+use sqlite3diff::{sendfile, write_del, Cksum, Delta, PageNumber, PAGE_SIZE, ErasedCksum};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::prelude::*;
@@ -60,9 +60,23 @@ use std::time::Duration;
 use zstr::zstr;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Message(PageNumber, Cksum);
+struct Message(PageNumber, ErasedCksum);
 
-type CksumCache = BTreeMap<PageNumber, Cksum>;
+type CksumCache<const N: usize> = BTreeMap<PageNumber, Cksum<N>>;
+
+enum ErasedSharedCache {
+    Cache16(RwLock<Arc<CksumCache<16>>>),
+    Cache32(RwLock<Arc<CksumCache<32>>>),
+}
+
+impl ErasedSharedCache {
+    fn new(cksum_len: CksumLen) -> Self {
+        match cksum_len {
+            CksumLen::Len16 => Self::Cache16(RwLock::new(Arc::new(BTreeMap::new()))),
+            CksumLen::Len32 => Self::Cache32(RwLock::new(Arc::new(BTreeMap::new()))),
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CheckpointPolicy {
@@ -70,21 +84,21 @@ pub enum CheckpointPolicy {
     Persist,
 }
 
-fn follower_comms_work(
+fn follower_comms_work<const N: usize>(
     db: File,
     mut stream: mio::net::TcpStream,
-    cache: &RwLock<Arc<CksumCache>>,
+    cache: &RwLock<Arc<CksumCache<N>>>,
     mut rx: BusReader<Message>,
     policy: CheckpointPolicy,
 ) -> anyhow::Result<BusReader<Message>> {
-    let mut buf = vec![Cksum([0; CKSUM_SIZE]); 5000].into_boxed_slice();
-    let mut lookup = IndexMap::<_, _, nohash::BuildNoHashHasher<Cksum>>::default();
+    let mut buf = vec![Cksum([0; N]); 5000].into_boxed_slice();
+    let mut lookup = IndexMap::<_, _, nohash::BuildNoHashHasher<Cksum<N>>>::default();
     let mut pgnos = 0u32..;
     let mut off = 0;
     loop {
         let n = {
             let bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len() * CKSUM_SIZE)
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len() * N)
             };
             let bytes = &mut bytes[off..];
             stream.read(bytes)?
@@ -93,8 +107,8 @@ fn follower_comms_work(
             break;
         }
         off += n;
-        if off % CKSUM_SIZE == 0 {
-            lookup.extend(buf.iter().copied().take(off / CKSUM_SIZE).zip(&mut pgnos));
+        if off % N == 0 {
+            lookup.extend(buf.iter().copied().take(off / N).zip(&mut pgnos));
             off = 0;
         }
     }
@@ -153,19 +167,32 @@ fn follower_comms_work(
     Ok(rx)
 }
 
+fn erased_follower_comms_work(
+    db: File,
+    stream: mio::net::TcpStream,
+    cache: &ErasedSharedCache,
+    rx: BusReader<Message>,
+    policy: CheckpointPolicy,
+) -> anyhow::Result<BusReader<Message>> {
+    match *cache {
+        ErasedSharedCache::Cache16(ref cache) => follower_comms_work(db, stream, cache, rx, policy),
+        ErasedSharedCache::Cache32(ref cache) => follower_comms_work(db, stream, cache, rx, policy),
+    }
+}
+
 enum DbReq {
     Exec(String),
     Checkpoint,
 }
 
-fn db_work(
+fn db_work<const N: usize>(
     db_name: &Path,
     mut bus: Bus<Message>,
     rx: mpsc::Receiver<DbReq>,
-    cache: &RwLock<Arc<CksumCache>>,
+    cache: &RwLock<Arc<CksumCache<N>>>,
 ) -> anyhow::Result<()> {
     let mut bus_rx = bus.add_rx();
-    let vfs = vfs::make(zstr!("unix-excl"), bus);
+    let vfs = vfs::make(zstr!("unix-excl"), bus, N);
     unsafe {
         sqlite3_vfs_register(vfs, 1 /* make default */)
     };
@@ -190,7 +217,7 @@ fn db_work(
                 }
                 // update checksum cache
                 while let Ok(Message(pgno, cksum)) = bus_rx.try_recv() {
-                    Arc::make_mut(&mut *cache.write()).insert(pgno, cksum);
+                    Arc::make_mut(&mut *cache.write()).insert(pgno, cksum.recover());
                 }
             }
         }
@@ -198,9 +225,27 @@ fn db_work(
     Ok(())
 }
 
+fn erased_db_work(
+    db_name: &Path,
+    bus: Bus<Message>,
+    rx: mpsc::Receiver<DbReq>,
+    cache: &ErasedSharedCache,
+) -> anyhow::Result<()> {
+    match *cache {
+        ErasedSharedCache::Cache16(ref cache) => db_work(db_name, bus, rx, cache),
+        ErasedSharedCache::Cache32(ref cache) => db_work(db_name, bus, rx, cache),
+    }
+}
+
 enum Status<'a> {
     Available(BusReader<Message>),
     Busy(std::thread::ScopedJoinHandle<'a, anyhow::Result<BusReader<Message>>>),
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CksumLen {
+    Len16 = 16,
+    Len32 = 32,
 }
 
 #[derive(Parser)]
@@ -208,6 +253,7 @@ struct Args {
     addr: String,
     db_name: PathBuf,
     checkpoint_policy: CheckpointPolicy,
+    cksum_len: CksumLen,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -218,6 +264,7 @@ fn main() -> anyhow::Result<()> {
         addr,
         db_name,
         checkpoint_policy,
+        cksum_len,
     } = Args::parse();
     let mut bus = Bus::new(1000);
     let snapshot_rx = bus.add_rx();
@@ -228,9 +275,9 @@ fn main() -> anyhow::Result<()> {
     k.registry()
         .register(&mut listener, mio::Token(17), mio::Interest::READABLE)?;
     let mut events = mio::Events::with_capacity(100);
-    let cache = RwLock::new(Arc::new(BTreeMap::new()));
+    let cache = ErasedSharedCache::new(cksum_len);
     std::thread::scope(|scope| {
-        let _db_thread = scope.spawn(|| db_work(&db_name, bus, db_rx, &cache));
+        let _db_thread = scope.spawn(|| erased_db_work(&db_name, bus, db_rx, &cache));
         let mut status = Status::Available(snapshot_rx);
         loop {
             // handle any new client or follower
@@ -249,9 +296,7 @@ fn main() -> anyhow::Result<()> {
                     stream.read_exact(std::slice::from_mut(&mut b))?;
                     let db = File::open(&db_name)?;
                     status =
-                        Status::Busy(scope.spawn(|| {
-                            follower_comms_work(db, stream, &cache, rx, checkpoint_policy)
-                        }));
+                        Status::Busy(scope.spawn(|| erased_follower_comms_work(db, stream, &cache, rx, checkpoint_policy)));
                 } else {
                     let mut sql = Vec::new();
                     stream.read_to_end(&mut sql)?;

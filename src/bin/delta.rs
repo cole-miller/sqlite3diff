@@ -26,7 +26,7 @@ fn main() {
     let page_count = (db_size / PAGE_SIZE as u64) as u32;
     assert!(args.matching_count <= args.follower_checksum_count);
     assert!(args.matching_count + args.leader_addl_cached_count <= page_count);
-    let lookup = build_lookup(args.follower_checksum_count);
+    let lookup = build_lookup::<MAX_CKSUM_SIZE>(args.follower_checksum_count);
 
     let cksums = make_leader_checksums(
         page_count,

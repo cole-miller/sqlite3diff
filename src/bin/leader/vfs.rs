@@ -1,13 +1,12 @@
-use crate::{Cksum, Message, PageNumber};
-use blake2::*;
+use crate::{Message, PageNumber};
+use sqlite3diff::{ErasedCksum, PAGE_SIZE, MAX_CKSUM_SIZE};
+use blake2::{Blake2sVar, digest::*};
 use bus::Bus;
 use rusqlite::ffi::*;
 use std::cell::{Cell, RefCell};
 use std::ffi::*;
 use std::mem::ManuallyDrop;
 use zstr::zstr;
-
-const PAGE_SIZE: usize = 4096;
 
 fn vtable() -> &'static sqlite3_io_methods {
     macro_rules! forward_to_orig {
@@ -92,6 +91,7 @@ fn open_impl(data: &Data, name: &CStr, flags: c_int) -> Result<(File, c_int), c_
             flags,
             tx: &data.tx,
             orig: buf,
+            cksum_len: data.cksum_len,
             pending_pgno: Cell::new(None),
         },
         flags_out,
@@ -107,15 +107,16 @@ fn write_impl(file: &File, data: &[u8], offset: i64) -> Result<(), c_int> {
     let tx = unsafe { &file.tx.as_ref().unwrap() };
     if file.flags & SQLITE_OPEN_MAIN_DB != 0 && data.len() == PAGE_SIZE {
         let pgno = offset / PAGE_SIZE as i64;
-        let mut hasher = Blake2s256::new();
+        let mut hasher = Blake2sVar::new(file.cksum_len).unwrap();
         hasher.update(data);
-        let cksum = Cksum(hasher.finalize().into());
-        tx.borrow_mut().broadcast(Message(pgno as u32, cksum));
+        let mut buf = [0; MAX_CKSUM_SIZE];
+        hasher.finalize_variable(&mut buf[..file.cksum_len]).unwrap();
+        tx.borrow_mut().broadcast(Message(pgno as u32, ErasedCksum(buf)));
     }
     Ok(())
 }
 
-pub fn make(orig: &CStr, tx: Bus<Message>) -> *mut sqlite3_vfs {
+pub fn make(orig: &CStr, tx: Bus<Message>, cksum_len: usize) -> *mut sqlite3_vfs {
     macro_rules! forward_to_base {
         ( $name:ident ( *mut sqlite3_vfs, $($a:ident: $t:ty),* ) $(-> $rt:ty)?) => { {
             #[allow(non_snake_case)]
@@ -159,6 +160,7 @@ pub fn make(orig: &CStr, tx: Bus<Message>) -> *mut sqlite3_vfs {
         pAppData: Box::into_raw(Box::new(Data {
             orig,
             tx: ManuallyDrop::new(RefCell::new(tx)),
+            cksum_len,
         }))
         .cast(),
         pNext: std::ptr::null_mut(),
@@ -186,6 +188,7 @@ pub fn make(orig: &CStr, tx: Bus<Message>) -> *mut sqlite3_vfs {
 struct Data {
     orig: *mut sqlite3_vfs,
     tx: ManuallyDrop<RefCell<Bus<Message>>>,
+    cksum_len: usize,
 }
 
 #[repr(C)]
@@ -194,5 +197,6 @@ struct File {
     orig: *mut sqlite3_file,
     tx: *const ManuallyDrop<RefCell<Bus<Message>>>,
     flags: c_int,
+    cksum_len: usize,
     pending_pgno: Cell<Option<PageNumber>>,
 }

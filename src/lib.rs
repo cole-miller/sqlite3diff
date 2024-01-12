@@ -3,8 +3,8 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::os::fd::*;
 
+pub const MAX_CKSUM_SIZE: usize = 32;
 pub const PAGE_SIZE: usize = 4096;
-pub const CKSUM_SIZE: usize = 32;
 
 pub type PageNumber = u32;
 
@@ -21,19 +21,31 @@ pub fn sendfile(output: RawFd, input: &File, start: u64, len: u64) -> Result<(),
     Ok(())
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct Cksum(pub [u8; CKSUM_SIZE]);
+pub struct Cksum<const N: usize>(pub [u8; N]);
 
-impl std::hash::Hash for Cksum {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ErasedCksum(pub [u8; MAX_CKSUM_SIZE]);
+
+impl ErasedCksum {
+    pub fn recover<const N: usize>(self) -> Cksum<N> {
+        Cksum(self.0[..N].try_into().unwrap())
+    }
+}
+
+#[derive(Debug)]
+pub struct WrongCksumSize;
+
+impl<const N: usize> std::hash::Hash for Cksum<N> {
     fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
         hasher.write_u64(u64::from_ne_bytes(self.0[..8].try_into().unwrap()));
     }
 }
 
-impl nohash::IsEnabled for Cksum {}
+impl<const N: usize> nohash::IsEnabled for Cksum<N> {}
 
-pub type Lookup = indexmap::IndexMap<Cksum, u32, nohash::BuildNoHashHasher<Cksum>>;
+pub type Lookup<const N: usize> = indexmap::IndexMap<Cksum<N>, PageNumber, nohash::BuildNoHashHasher<Cksum<N>>>;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Del {
@@ -123,10 +135,10 @@ pub fn write_del(
     Ok(())
 }
 
-pub fn stream_delta(
+pub fn stream_delta<const N: usize>(
     input: &File,
-    cksums: impl Iterator<Item = Option<Cksum>>,
-    lookup: &Lookup,
+    cksums: impl Iterator<Item = Option<Cksum<N>>>,
+    lookup: &Lookup<N>,
     output: &mut (impl Write + AsRawFd),
 ) -> Result<(), std::io::Error> {
     let mut delta = Delta::new();
@@ -162,7 +174,10 @@ pub fn stream_delta(
     Ok(())
 }
 
-pub fn build_lookup(n: u32) -> Lookup {
+pub fn build_lookup<const N: usize>(n: u32) -> Lookup<N>
+where
+    rand::distributions::Standard: Distribution<[u8; N]>
+{
     let mut rng = SmallRng::from_entropy();
     (0..n).map(|i| (Cksum(rng.gen()), i)).collect()
 }
@@ -198,29 +213,29 @@ impl RngCore for Lcg {
     }
 }
 
-pub fn make_leader_checksums(
+pub fn make_leader_checksums<const N: usize>(
     num_pages: u32,
     matching_count: u32,
     non_matching_count: u32,
-    lookup: &Lookup,
-) -> impl '_ + Iterator<Item = Option<Cksum>> {
-    struct MakeChecksums<'a> {
+    lookup: &Lookup<N>,
+) -> impl '_ + Iterator<Item = Option<Cksum<N>>> {
+    struct MakeChecksums<'a, const N: usize> {
         matching_count: u32,
         non_matching_count: u32,
         non_cached_count: u32,
-        lookup: &'a Lookup,
+        lookup: &'a Lookup<N>,
         rng: Lcg,
     }
 
-    impl<'a> Iterator for MakeChecksums<'a> {
-        type Item = Option<Cksum>;
+    impl<'a, const N: usize> Iterator for MakeChecksums<'a, N> {
+        type Item = Option<Cksum<N>>;
 
         fn next(&mut self) -> Option<Self::Item> {
             let slice = self.lookup.as_slice();
             let x = self.rng.gen_range(0..slice.len() as u64);
             let matching = *slice.get_index(x as usize).unwrap().0;
             // gin up a checksum that's unlikely to be in the table
-            let mut non_matching = [0; CKSUM_SIZE];
+            let mut non_matching = [0; N];
             non_matching[..8].copy_from_slice(&u64::to_be_bytes(x)[..]);
             let non_matching = Cksum(non_matching);
             let mut pairs = [
