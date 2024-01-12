@@ -1,3 +1,28 @@
+//! This file implements a dqlite-like server that can execute SQL requests from clients against a
+//! single on-disk database, trigger checkpoints, and stream checksum-based snapshots to
+//! "followers". It does not implement any part of the Raft protocol.
+//!
+//! There are three threads:
+//!
+//! * The "database thread" (see `db_work`) is a long-lived thread that holds a SQLite database
+//!   connection and executes transactions and checkpoints against that connection. It uses a
+//!   custom VFS (see the `vfs` module).
+//!
+//! * The "snapshot thread" (see `follower_comms_work`) exists only when a pseudo-follower has connected to the server and
+//!   requested to receive a snapshot, and lives just long enough to service that follower. Only
+//!   one follower can be receiving a snapshot at a time. This thread sends "copy" and "move" instructions in the rdiff format
+//!   to the follower based on the checksums received from the follower and on a local cache of
+//!   checksums that is updated after each checkpoint by the database thread. When it has finished
+//!   scanning the database file in this way, it checks whether a checkpoint occurred in the
+//!   meantime. If so it either (based on the `CheckpointPolicy`) aborts the installation process
+//!   (special rdiff instruction) or tries again by sending copies of just the pages affected by
+//!   the checkpoint (another special rdiff instruction).
+//! * The main thread handles client communications and dispatches work to the other two threads.
+//!
+//! SQLite's auto-checkpoint is turned off; you can trigger a checkpoint from outside by sending
+//! SIGUSR1 to the server process. The server listens for both clients and followers on the same
+//! address, provided on the command line.
+
 use bus::*;
 use clap::{Parser, ValueEnum};
 use indexmap::IndexMap;
@@ -108,8 +133,6 @@ fn follower_comms_work(
             }
         }
     }
-    // then loop checking for checkpoint notifications until there are none, handling them by
-    // sending pages (need to extend the wire format to support this)
     stream.write_all(&[0])?;
     Ok(rx)
 }
