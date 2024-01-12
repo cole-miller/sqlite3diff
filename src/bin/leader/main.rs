@@ -45,7 +45,7 @@ use indexmap::IndexMap;
 use parking_lot::RwLock;
 use rusqlite::ffi::*;
 use signal_hook::consts::SIGUSR1;
-use sqlite3diff::{sendfile, write_del, Cksum, Delta, PageNumber, PAGE_SIZE, ErasedCksum};
+use sqlite3diff::*;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::prelude::*;
@@ -248,11 +248,22 @@ enum CksumLen {
     Len32 = 32,
 }
 
+fn cksum_len_parser(s: &str) -> Result<CksumLen, Box<dyn std::error::Error + Send + Sync>> {
+    match s.parse()? {
+        16 => Ok(CksumLen::Len16),
+        32 => Ok(CksumLen::Len32),
+        _ => Err(WrongCksumSize.into()),
+    }
+}
+
 #[derive(Parser)]
 struct Args {
-    addr: String,
     db_name: PathBuf,
+    #[arg(long)]
+    addr: String,
+    #[arg(long)]
     checkpoint_policy: CheckpointPolicy,
+    #[arg(long, value_parser = cksum_len_parser)]
     cksum_len: CksumLen,
 }
 

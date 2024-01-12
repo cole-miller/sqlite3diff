@@ -37,6 +37,14 @@ impl ErasedCksum {
 #[derive(Debug)]
 pub struct WrongCksumSize;
 
+impl std::fmt::Display for WrongCksumSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "bad checksum size")
+    }
+}
+
+impl std::error::Error for WrongCksumSize {}
+
 impl<const N: usize> std::hash::Hash for Cksum<N> {
     fn hash<H: std::hash::Hasher>(&self, hasher: &mut H) {
         hasher.write_u64(u64::from_ne_bytes(self.0[..8].try_into().unwrap()));
