@@ -8,7 +8,6 @@ use std::mem::ManuallyDrop;
 use zstr::zstr;
 
 const PAGE_SIZE: usize = 4096;
-const FRAME_HEADER_SIZE: usize = 24;
 
 fn vtable() -> &'static sqlite3_io_methods {
     macro_rules! forward_to_orig {
@@ -108,20 +107,10 @@ fn write_impl(file: &File, data: &[u8], offset: i64) -> Result<(), c_int> {
     let tx = unsafe { &file.tx.as_ref().unwrap() };
     if file.flags & SQLITE_OPEN_MAIN_DB != 0 && data.len() == PAGE_SIZE {
         let pgno = offset / PAGE_SIZE as i64;
-        tx.borrow_mut().broadcast(Message::DbWrite(pgno as u32));
-    } else if file.flags & SQLITE_OPEN_WAL != 0 && data.len() == FRAME_HEADER_SIZE {
-        let pgno = u32::from_be_bytes(data[0..4].try_into().unwrap());
-        let None = file.pending_pgno.replace(Some(pgno)) else {
-            panic!()
-        };
-    } else if file.flags & SQLITE_OPEN_WAL != 0 && data.len() == PAGE_SIZE {
         let mut hasher = Blake2s256::new();
         hasher.update(data);
         let cksum = Cksum(hasher.finalize().into());
-        let Some(pgno) = file.pending_pgno.take() else {
-            panic!()
-        };
-        tx.borrow_mut().broadcast(Message::WalWrite(pgno, cksum));
+        tx.borrow_mut().broadcast(Message(pgno as u32, cksum));
     }
     Ok(())
 }

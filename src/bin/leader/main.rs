@@ -15,11 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use zstr::zstr;
 
-#[derive(Clone, Copy)]
-enum Message {
-    WalWrite(PageNumber, Cksum),
-    DbWrite(PageNumber),
-}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Message(PageNumber, Cksum);
 
 type CksumCache = BTreeMap<PageNumber, Cksum>;
 
@@ -83,10 +80,8 @@ fn follower_comms_work(
 
     loop {
         let mut updated = vec![];
-        while let Ok(msg) = rx.try_recv() {
-            if let Message::DbWrite(pgno) = msg {
-                updated.push(pgno);
-            }
+        while let Ok(Message(pgno, _)) = rx.try_recv() {
+            updated.push(pgno);
         }
         if updated.len() == 0 {
             break;
@@ -94,6 +89,7 @@ fn follower_comms_work(
         match policy {
             CheckpointPolicy::Bail => {
                 stream.write_all(&[0xff])?;
+                return Ok(rx)
             }
             CheckpointPolicy::Persist => {
                 for pgno in updated {
@@ -188,12 +184,6 @@ fn main() -> anyhow::Result<()> {
                 };
             }
         }
-        // handle backlog of newly-computed checksums
-        while let Ok(msg) = my_rx.try_recv() {
-            if let Message::WalWrite(pgno, cksum) = msg {
-                Arc::make_mut(&mut cache).insert(pgno, cksum);
-            }
-        }
         // trigger explicit checkpoint on SIGUSR1
         if checkpoint_flag.fetch_and(false, Ordering::SeqCst) {
             unsafe {
@@ -204,6 +194,10 @@ fn main() -> anyhow::Result<()> {
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                 );
+            }
+            // update checksum cache
+            while let Ok(Message(pgno, cksum)) = my_rx.try_recv() {
+                Arc::make_mut(&mut cache).insert(pgno, cksum);
             }
         }
     }
