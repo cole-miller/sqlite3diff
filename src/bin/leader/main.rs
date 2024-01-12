@@ -242,20 +242,6 @@ enum Status<'a> {
     Busy(std::thread::ScopedJoinHandle<'a, anyhow::Result<BusReader<Message>>>),
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum CksumLen {
-    Len16 = 16,
-    Len32 = 32,
-}
-
-fn cksum_len_parser(s: &str) -> Result<CksumLen, Box<dyn std::error::Error + Send + Sync>> {
-    match s.parse()? {
-        16 => Ok(CksumLen::Len16),
-        32 => Ok(CksumLen::Len32),
-        _ => Err(WrongCksumSize.into()),
-    }
-}
-
 #[derive(Parser)]
 struct Args {
     db_name: PathBuf,

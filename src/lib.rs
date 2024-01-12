@@ -2,6 +2,7 @@ use rand::prelude::*;
 use std::fs::File;
 use std::io::prelude::*;
 use std::os::fd::*;
+use clap::ValueEnum;
 
 pub const MAX_CKSUM_SIZE: usize = 32;
 pub const PAGE_SIZE: usize = 4096;
@@ -268,4 +269,18 @@ pub fn make_leader_checksums<const N: usize>(
         rng: Lcg { state: 17 },
     })
     .take(num_pages as usize)
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum CksumLen {
+    Len16 = 16,
+    Len32 = 32,
+}
+
+pub fn cksum_len_parser(s: &str) -> Result<CksumLen, Box<dyn std::error::Error + Send + Sync>> {
+    match s.parse()? {
+        16 => Ok(CksumLen::Len16),
+        32 => Ok(CksumLen::Len32),
+        _ => Err(WrongCksumSize.into()),
+    }
 }
