@@ -1,12 +1,12 @@
-use clap::Parser;
-use blake2::{Blake2sVar, digest::*};
-use std::io::prelude::*;
-use sqlite3diff::*;
-use std::net::{TcpStream, Shutdown};
 use anyhow::bail;
-use std::fs::File;
-use std::path::PathBuf;
+use blake2::{digest::*, Blake2sVar};
+use clap::Parser;
 use sqlite3diff::PAGE_SIZE;
+use sqlite3diff::*;
+use std::fs::File;
+use std::io::prelude::*;
+use std::net::{Shutdown, TcpStream};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 struct Args {
@@ -19,7 +19,12 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
-    let Args { addr, from_file: Some(path), cksum_len } = Args::parse() else {
+    let Args {
+        addr,
+        from_file: Some(path),
+        cksum_len,
+    } = Args::parse()
+    else {
         bail!("--from-file is required")
     };
     let cksum_len = cksum_len as usize;
@@ -33,13 +38,21 @@ fn main() -> anyhow::Result<()> {
     loop {
         let off = db.read(&mut buf[..])?;
         assert!(off % PAGE_SIZE == 0);
-        for (i, pg) in buf.chunks_exact(PAGE_SIZE).take(off / PAGE_SIZE).enumerate() {
+        for (i, pg) in buf
+            .chunks_exact(PAGE_SIZE)
+            .take(off / PAGE_SIZE)
+            .enumerate()
+        {
             let mut hasher = Blake2sVar::new(cksum_len).unwrap();
             hasher.update(pg);
-            hasher.finalize_variable(&mut cksum_buf[i * cksum_len..(i + 1) * cksum_len]).unwrap();
+            hasher
+                .finalize_variable(&mut cksum_buf[i * cksum_len..(i + 1) * cksum_len])
+                .unwrap();
         }
         stream.write_all(&cksum_buf[..(off / PAGE_SIZE) * cksum_len])?;
-        if off < buf.len() { break }
+        if off < buf.len() {
+            break;
+        }
     }
     stream.shutdown(Shutdown::Write)?;
     std::io::copy(&mut stream, &mut devnull)?;

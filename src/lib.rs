@@ -1,8 +1,8 @@
+use clap::ValueEnum;
 use rand::prelude::*;
 use std::fs::File;
 use std::io::prelude::*;
 use std::os::fd::*;
-use clap::ValueEnum;
 
 pub const MAX_CKSUM_SIZE: usize = 32;
 pub const PAGE_SIZE: usize = 4096;
@@ -54,7 +54,8 @@ impl<const N: usize> std::hash::Hash for Cksum<N> {
 
 impl<const N: usize> nohash::IsEnabled for Cksum<N> {}
 
-pub type Lookup<const N: usize> = indexmap::IndexMap<Cksum<N>, PageNumber, nohash::BuildNoHashHasher<Cksum<N>>>;
+pub type Lookup<const N: usize> =
+    indexmap::IndexMap<Cksum<N>, PageNumber, nohash::BuildNoHashHasher<Cksum<N>>>;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Del {
@@ -185,7 +186,7 @@ pub fn stream_delta<const N: usize>(
 
 pub fn build_lookup<const N: usize>(n: u32) -> Lookup<N>
 where
-    rand::distributions::Standard: Distribution<[u8; N]>
+    rand::distributions::Standard: Distribution<[u8; N]>,
 {
     let mut rng = SmallRng::from_entropy();
     (0..n).map(|i| (Cksum(rng.gen()), i)).collect()

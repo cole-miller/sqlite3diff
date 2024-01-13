@@ -1,8 +1,8 @@
 use crate::{Message, PageNumber};
-use sqlite3diff::{ErasedCksum, PAGE_SIZE, MAX_CKSUM_SIZE};
-use blake2::{Blake2sVar, digest::*};
+use blake2::{digest::*, Blake2sVar};
 use bus::Bus;
 use rusqlite::ffi::*;
+use sqlite3diff::{ErasedCksum, MAX_CKSUM_SIZE, PAGE_SIZE};
 use std::cell::{Cell, RefCell};
 use std::ffi::*;
 use std::mem::ManuallyDrop;
@@ -110,8 +110,11 @@ fn write_impl(file: &File, data: &[u8], offset: i64) -> Result<(), c_int> {
         let mut hasher = Blake2sVar::new(file.cksum_len).unwrap();
         hasher.update(data);
         let mut buf = [0; MAX_CKSUM_SIZE];
-        hasher.finalize_variable(&mut buf[..file.cksum_len]).unwrap();
-        tx.borrow_mut().broadcast(Message(pgno as u32, ErasedCksum(buf)));
+        hasher
+            .finalize_variable(&mut buf[..file.cksum_len])
+            .unwrap();
+        tx.borrow_mut()
+            .broadcast(Message(pgno as u32, ErasedCksum(buf)));
     }
     Ok(())
 }

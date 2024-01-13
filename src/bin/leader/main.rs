@@ -49,6 +49,7 @@ use sqlite3diff::*;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::prelude::*;
+use std::mem::MaybeUninit;
 use std::net::ToSocketAddrs;
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -97,9 +98,8 @@ fn follower_comms_work<const N: usize>(
     let mut off = 0;
     loop {
         let n = {
-            let bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len() * N)
-            };
+            let bytes: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len() * N) };
             let bytes = &mut bytes[off..];
             stream.read(bytes)?
         };
@@ -269,8 +269,21 @@ fn main() -> anyhow::Result<()> {
     let mut listener = mio::net::TcpListener::bind(addr)?;
     let mut k = mio::Poll::new()?;
     let (db_tx, db_rx) = mpsc::channel();
+    let accept_tok = mio::Token(17);
     k.registry()
-        .register(&mut listener, mio::Token(17), mio::Interest::READABLE)?;
+        .register(&mut listener, accept_tok, mio::Interest::READABLE)?;
+    let sigfd = unsafe {
+        let mut set = MaybeUninit::uninit();
+        libc::sigemptyset(set.as_mut_ptr());
+        libc::sigaddset(set.as_mut_ptr(), SIGUSR1);
+        libc::signalfd(-1, set.as_ptr(), 0)
+    };
+    let signal_tok = mio::Token(42);
+    k.registry().register(
+        &mut mio::unix::SourceFd(&sigfd),
+        signal_tok,
+        mio::Interest::READABLE,
+    )?;
     let mut events = mio::Events::with_capacity(100);
     let cache = ErasedSharedCache::new(cksum_len);
     std::thread::scope(|scope| {
@@ -279,26 +292,31 @@ fn main() -> anyhow::Result<()> {
         loop {
             // handle any new client or follower
             k.poll(&mut events, Some(Duration::from_millis(10)))?;
-            if events.iter().count() > 0 {
-                let (mut stream, _) = listener.accept()?;
-                let mut b = 0;
-                let n = stream.peek(std::slice::from_mut(&mut b))?;
-                if n == 0 {
-                    continue;
-                }
-                if b == b'\0' {
-                    let Status::Available(rx) = status else {
+            for ev in &events {
+                if ev.token() == accept_tok {
+                    let (mut stream, _) = listener.accept()?;
+                    let mut b = 0;
+                    let n = stream.peek(std::slice::from_mut(&mut b))?;
+                    if n == 0 {
                         continue;
-                    };
-                    stream.read_exact(std::slice::from_mut(&mut b))?;
-                    let db = File::open(&db_name)?;
-                    status =
-                        Status::Busy(scope.spawn(|| erased_follower_comms_work(db, stream, &cache, rx, checkpoint_policy)));
-                } else {
-                    let mut sql = Vec::new();
-                    stream.read_to_end(&mut sql)?;
-                    let sql = String::from_utf8(sql)?;
-                    let _ = db_tx.send(DbReq::Exec(sql));
+                    }
+                    if b == b'\0' {
+                        let Status::Available(rx) = status else {
+                            continue;
+                        };
+                        stream.read_exact(std::slice::from_mut(&mut b))?;
+                        let db = File::open(&db_name)?;
+                        status = Status::Busy(scope.spawn(|| {
+                            erased_follower_comms_work(db, stream, &cache, rx, checkpoint_policy)
+                        }));
+                    } else {
+                        let mut sql = Vec::new();
+                        stream.read_to_end(&mut sql)?;
+                        let sql = String::from_utf8(sql)?;
+                        let _ = db_tx.send(DbReq::Exec(sql));
+                    }
+                } else if ev.token() == signal_tok {
+                    let _ = db_tx.send(DbReq::Checkpoint);
                 }
             }
             // handle any follower that's finished getting up to date
@@ -312,10 +330,6 @@ fn main() -> anyhow::Result<()> {
                         Err(e) => std::panic::resume_unwind(e),
                     };
                 }
-            }
-            // trigger explicit checkpoint on SIGUSR1
-            if checkpoint_flag.fetch_and(false, Ordering::SeqCst) {
-                let _ = db_tx.send(DbReq::Checkpoint);
             }
         }
     })
