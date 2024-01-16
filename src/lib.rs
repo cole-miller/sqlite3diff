@@ -1,4 +1,5 @@
 use clap::ValueEnum;
+use nix::sys::sendfile::sendfile64;
 use rand::prelude::*;
 use std::fs::File;
 use std::io::prelude::*;
@@ -8,19 +9,6 @@ pub const MAX_CKSUM_SIZE: usize = 32;
 pub const PAGE_SIZE: usize = 4096;
 
 pub type PageNumber = u32;
-
-pub fn sendfile(output: RawFd, input: &File, start: u64, len: u64) -> Result<(), std::io::Error> {
-    let mut off: libc::off_t = start.try_into().unwrap();
-    let mut count: libc::size_t = len.try_into().unwrap();
-    while count > 0 {
-        let n = unsafe { libc::sendfile(output.as_raw_fd(), input.as_raw_fd(), &mut off, count) };
-        if n == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        count -= n as libc::size_t;
-    }
-    Ok(())
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
@@ -120,15 +108,17 @@ pub fn write_del(
     match del {
         Del::Transfer { start, len } => {
             // TODO TCP_CORK?
-            let (start, len) = (
-                start as u64 * PAGE_SIZE as u64,
-                len as u64 * PAGE_SIZE as u64,
-            );
+            let (mut start, len) = (start as i64 * PAGE_SIZE as i64, len as usize * PAGE_SIZE);
             let mut hdr = [0; 9];
-            hdr[0] = 0x44;
-            hdr[1..].copy_from_slice(&u64::to_be_bytes(len));
+            hdr[0] = RS_OP_LITERAL_N8;
+            hdr[1..].copy_from_slice(&u64::to_be_bytes(len as u64));
             output.write_all(&hdr)?;
-            sendfile(output.as_raw_fd(), input, start, len)?;
+            sendfile64(
+                unsafe { BorrowedFd::borrow_raw(output.as_raw_fd()) },
+                input,
+                Some(&mut start),
+                len,
+            )?;
         }
         Del::Reuse { start, len } => {
             let (start, len) = (
@@ -136,7 +126,7 @@ pub fn write_del(
                 len as u64 * PAGE_SIZE as u64,
             );
             let mut hdr = [0; 17];
-            hdr[0] = 0x54;
+            hdr[0] = RS_OP_COPY_N8_N8;
             hdr[1..9].copy_from_slice(&u64::to_be_bytes(start));
             hdr[9..].copy_from_slice(&u64::to_be_bytes(len));
             output.write_all(&hdr)?;
@@ -176,7 +166,7 @@ pub fn stream_delta<const N: usize>(
     }
     // flush
     write_del(delta.wip, input, output)?;
-    output.write_all(&[0])?;
+    output.write_all(&[RS_OP_END])?;
     dbg!(hit_count);
     dbg!(miss_count);
     dbg!(unavailable_count);
@@ -285,3 +275,9 @@ pub fn cksum_len_parser(s: &str) -> Result<CksumLen, Box<dyn std::error::Error +
         _ => Err(WrongCksumSize.into()),
     }
 }
+
+pub const RS_OP_LITERAL_N8: u8 = 0x44;
+pub const RS_OP_COPY_N8_N8: u8 = 0x54;
+pub const RS_OP_END: u8 = 0x00;
+pub const OP_LITERAL_AT_N8_N8: u8 = 0xfe;
+pub const OP_DELTA_FAILED: u8 = 0xff;

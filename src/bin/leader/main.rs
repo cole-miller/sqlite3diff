@@ -42,19 +42,20 @@
 use bus::*;
 use clap::{Parser, ValueEnum};
 use indexmap::IndexMap;
+use nix::sys::sendfile::sendfile64;
+use nix::sys::signal::{SigSet, Signal};
+use nix::sys::signalfd::SignalFd;
 use parking_lot::RwLock;
 use rusqlite::ffi::*;
-use signal_hook::consts::SIGUSR1;
 use sqlite3diff::*;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::prelude::*;
-use std::mem::MaybeUninit;
 use std::net::ToSocketAddrs;
 use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::*;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -148,17 +149,22 @@ fn follower_comms_work<const N: usize>(
         }
         match policy {
             CheckpointPolicy::Bail => {
-                stream.write_all(&[0xff])?;
+                stream.write_all(&[OP_DELTA_FAILED])?;
                 return Ok(rx);
             }
             CheckpointPolicy::Persist => {
                 for pgno in updated {
                     let mut hdr = [0; 17];
-                    hdr[0] = 0xfe;
-                    let start = pgno as u64 & PAGE_SIZE as u64;
-                    hdr[1..9].copy_from_slice(&u64::to_be_bytes(start));
+                    hdr[0] = OP_LITERAL_AT_N8_N8;
+                    let mut start = pgno as i64 * PAGE_SIZE as i64;
+                    hdr[1..9].copy_from_slice(&u64::to_be_bytes(start as u64));
                     hdr[9..].copy_from_slice(&u64::to_be_bytes(PAGE_SIZE as u64));
-                    sendfile(stream.as_raw_fd(), &db, start, PAGE_SIZE as u64)?;
+                    sendfile64(
+                        unsafe { BorrowedFd::borrow_raw(stream.as_raw_fd()) },
+                        &db,
+                        Some(&mut start),
+                        PAGE_SIZE,
+                    )?;
                 }
             }
         }
@@ -254,9 +260,6 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
-    let checkpoint_flag = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(SIGUSR1, Arc::clone(&checkpoint_flag))?;
-
     let Args {
         addr,
         db_name,
@@ -272,15 +275,13 @@ fn main() -> anyhow::Result<()> {
     let accept_tok = mio::Token(17);
     k.registry()
         .register(&mut listener, accept_tok, mio::Interest::READABLE)?;
-    let sigfd = unsafe {
-        let mut set = MaybeUninit::uninit();
-        libc::sigemptyset(set.as_mut_ptr());
-        libc::sigaddset(set.as_mut_ptr(), SIGUSR1);
-        libc::signalfd(-1, set.as_ptr(), 0)
-    };
+    let mut sigset = SigSet::empty();
+    sigset.add(Signal::SIGUSR1);
+    sigset.thread_block()?;
+    let sigfd = SignalFd::new(&sigset)?;
     let signal_tok = mio::Token(42);
     k.registry().register(
-        &mut mio::unix::SourceFd(&sigfd),
+        &mut mio::unix::SourceFd(&sigfd.as_raw_fd()),
         signal_tok,
         mio::Interest::READABLE,
     )?;
