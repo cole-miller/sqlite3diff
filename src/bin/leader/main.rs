@@ -260,6 +260,9 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    const ACCEPT_TOK: mio::Token = mio::Token(17);
+    const SIGNAL_TOK: mio::Token = mio::Token(42);
+
     let Args {
         addr,
         db_name,
@@ -272,17 +275,15 @@ fn main() -> anyhow::Result<()> {
     let mut listener = mio::net::TcpListener::bind(addr)?;
     let mut k = mio::Poll::new()?;
     let (db_tx, db_rx) = mpsc::channel();
-    let accept_tok = mio::Token(17);
     k.registry()
-        .register(&mut listener, accept_tok, mio::Interest::READABLE)?;
+        .register(&mut listener, ACCEPT_TOK, mio::Interest::READABLE)?;
     let mut sigset = SigSet::empty();
     sigset.add(Signal::SIGUSR1);
     sigset.thread_block()?;
     let sigfd = SignalFd::new(&sigset)?;
-    let signal_tok = mio::Token(42);
     k.registry().register(
         &mut mio::unix::SourceFd(&sigfd.as_raw_fd()),
-        signal_tok,
+        SIGNAL_TOK,
         mio::Interest::READABLE,
     )?;
     let mut events = mio::Events::with_capacity(100);
@@ -294,30 +295,40 @@ fn main() -> anyhow::Result<()> {
             // handle any new client or follower
             k.poll(&mut events, Some(Duration::from_millis(10)))?;
             for ev in &events {
-                if ev.token() == accept_tok {
-                    let (mut stream, _) = listener.accept()?;
-                    let mut b = 0;
-                    let n = stream.peek(std::slice::from_mut(&mut b))?;
-                    if n == 0 {
-                        continue;
-                    }
-                    if b == b'\0' {
-                        let Status::Available(rx) = status else {
+                match ev.token() {
+                    ACCEPT_TOK => {
+                        let (mut stream, _) = listener.accept()?;
+                        let mut b = 0;
+                        let n = stream.peek(std::slice::from_mut(&mut b))?;
+                        if n == 0 {
                             continue;
-                        };
-                        stream.read_exact(std::slice::from_mut(&mut b))?;
-                        let db = File::open(&db_name)?;
-                        status = Status::Busy(scope.spawn(|| {
-                            erased_follower_comms_work(db, stream, &cache, rx, checkpoint_policy)
-                        }));
-                    } else {
-                        let mut sql = Vec::new();
-                        stream.read_to_end(&mut sql)?;
-                        let sql = String::from_utf8(sql)?;
-                        let _ = db_tx.send(DbReq::Exec(sql));
+                        }
+                        if b == b'\0' {
+                            let Status::Available(rx) = status else {
+                                continue;
+                            };
+                            stream.read_exact(std::slice::from_mut(&mut b))?;
+                            let db = File::open(&db_name)?;
+                            status = Status::Busy(scope.spawn(|| {
+                                erased_follower_comms_work(
+                                    db,
+                                    stream,
+                                    &cache,
+                                    rx,
+                                    checkpoint_policy,
+                                )
+                            }));
+                        } else {
+                            let mut sql = Vec::new();
+                            stream.read_to_end(&mut sql)?;
+                            let sql = String::from_utf8(sql)?;
+                            let _ = db_tx.send(DbReq::Exec(sql));
+                        }
                     }
-                } else if ev.token() == signal_tok {
-                    let _ = db_tx.send(DbReq::Checkpoint);
+                    SIGNAL_TOK => {
+                        let _ = db_tx.send(DbReq::Checkpoint);
+                    }
+                    _ => unreachable!(),
                 }
             }
             // handle any follower that's finished getting up to date
