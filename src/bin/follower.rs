@@ -1,10 +1,12 @@
 use anyhow::bail;
 use blake2::{digest::*, Blake2sVar};
+use byteorder::*;
 use clap::Parser;
-use sqlite3diff::PAGE_SIZE;
+use nix::fcntl::copy_file_range;
 use sqlite3diff::*;
 use std::fs::File;
 use std::io::prelude::*;
+use std::io::SeekFrom;
 use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
 
@@ -18,6 +20,33 @@ struct Args {
     cksum_len: CksumLen,
 }
 
+fn process_cmd(sock: &mut impl Read, base: &File, mut out: &File) -> anyhow::Result<Option<()>> {
+    let x = match sock.read_u8()? {
+        RS_OP_LITERAL_N8 => {
+            let len = sock.read_u64::<BE>()?;
+            std::io::copy(&mut sock.take(len), &mut out)?;
+            Some(())
+        }
+        RS_OP_COPY_N8_N8 => {
+            let start = sock.read_u64::<BE>()?;
+            let len = sock.read_u64::<BE>()?;
+            copy_file_range(base, Some(&mut (start as i64)), out, None, len as usize)?;
+            Some(())
+        }
+        OP_LITERAL_AT_N8_N8 => {
+            let start = sock.read_u64::<BE>()?;
+            let len = sock.read_u64::<BE>()?;
+            out.seek(SeekFrom::Start(start))?;
+            std::io::copy(&mut sock.take(len), &mut out)?;
+            Some(())
+        }
+        RS_OP_END => None,
+        OP_DELTA_FAILED => bail!("delta installation was aborted by the leader"),
+        _ => bail!("invalid command byte"),
+    };
+    Ok(x)
+}
+
 fn main() -> anyhow::Result<()> {
     let Args {
         addr,
@@ -29,7 +58,7 @@ fn main() -> anyhow::Result<()> {
     };
     let cksum_len = cksum_len as usize;
     let mut db = File::open(&path)?;
-    let mut devnull = File::open("/dev/null")?;
+    let devnull = File::open("/dev/null")?;
     let mut stream = TcpStream::connect(addr)?;
     stream.write_all(&[0])?;
     let multiplier = 200;
@@ -55,6 +84,6 @@ fn main() -> anyhow::Result<()> {
         }
     }
     stream.shutdown(Shutdown::Write)?;
-    std::io::copy(&mut stream, &mut devnull)?;
+    while let Some(()) = process_cmd(&mut stream, &db, &devnull)? {}
     Ok(())
 }
